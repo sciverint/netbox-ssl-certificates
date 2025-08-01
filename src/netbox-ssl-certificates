@@ -1,0 +1,399 @@
+# netbox_ssl_certificates/__init__.py
+from netbox.plugins import PluginConfig
+
+class SSLCertificatesConfig(PluginConfig):
+    name = 'netbox_ssl_certificates'
+    verbose_name = 'SSL Certificates'
+    description = 'Track SSL certificates and their expiry dates'
+    version = '1.0.0'
+    base_url = 'ssl-certificates'
+    min_version = '3.0.0'
+
+config = SSLCertificatesConfig
+
+# netbox_ssl_certificates/models.py
+from django.db import models
+from django.urls import reverse
+from django.core.validators import MinValueValidator, MaxValueValidator
+from netbox.models import NetBoxModel
+from utilities.choices import ChoiceSet
+from datetime import datetime, timezone
+
+class CertificateTypeChoices(ChoiceSet):
+    key = 'CertificateType'
+    
+    CHOICES = [
+        ('domain', 'Domain Validated (DV)', 'green'),
+        ('organization', 'Organization Validated (OV)', 'blue'),
+        ('extended', 'Extended Validation (EV)', 'purple'),
+        ('wildcard', 'Wildcard', 'orange'),
+        ('self_signed', 'Self-Signed', 'gray'),
+    ]
+
+class CertificateStatusChoices(ChoiceSet):
+    key = 'CertificateStatus'
+    
+    CHOICES = [
+        ('active', 'Active', 'green'),
+        ('expired', 'Expired', 'red'),
+        ('expiring_soon', 'Expiring Soon', 'yellow'),
+        ('revoked', 'Revoked', 'gray'),
+        ('pending', 'Pending', 'blue'),
+    ]
+
+class SSLCertificate(NetBoxModel):
+    name = models.CharField(
+        max_length=100,
+        help_text="Friendly name for the certificate"
+    )
+    
+    common_name = models.CharField(
+        max_length=255,
+        help_text="Primary domain name for the certificate"
+    )
+    
+    subject_alternative_names = models.TextField(
+        blank=True,
+        help_text="Additional domain names (SANs), one per line"
+    )
+    
+    certificate_type = models.CharField(
+        max_length=50,
+        choices=CertificateTypeChoices,
+        default=CertificateTypeChoices.CHOICES[0][0]
+    )
+    
+    issuer = models.CharField(
+        max_length=255,
+        help_text="Certificate Authority that issued the certificate"
+    )
+    
+    serial_number = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Certificate serial number"
+    )
+    
+    issued_date = models.DateField(
+        help_text="Date when the certificate was issued"
+    )
+    
+    expiry_date = models.DateField(
+        help_text="Date when the certificate expires"
+    )
+    
+    key_size = models.PositiveIntegerField(
+        validators=[MinValueValidator(512), MaxValueValidator(8192)],
+        default=2048,
+        help_text="Key size in bits"
+    )
+    
+    signature_algorithm = models.CharField(
+        max_length=50,
+        default='SHA256withRSA',
+        help_text="Signature algorithm used"
+    )
+    
+    status = models.CharField(
+        max_length=50,
+        choices=CertificateStatusChoices,
+        default=CertificateStatusChoices.CHOICES[0][0]
+    )
+    
+    auto_renewal = models.BooleanField(
+        default=False,
+        help_text="Whether this certificate has auto-renewal enabled"
+    )
+    
+    certificate_pem = models.TextField(
+        blank=True,
+        help_text="PEM encoded certificate (optional)"
+    )
+    
+    notes = models.TextField(
+        blank=True,
+        help_text="Additional notes about this certificate"
+    )
+
+    class Meta:
+        ordering = ['expiry_date', 'common_name']
+        unique_together = ['common_name', 'serial_number']
+
+    def __str__(self):
+        return f"{self.name} ({self.common_name})"
+
+    def get_absolute_url(self):
+        return reverse('plugins:netbox_ssl_certificates:sslcertificate', args=[self.pk])
+
+    @property
+    def days_until_expiry(self):
+        """Calculate days until certificate expires"""
+        today = datetime.now().date()
+        delta = self.expiry_date - today
+        return delta.days
+
+    @property
+    def is_expired(self):
+        """Check if certificate is expired"""
+        return self.days_until_expiry < 0
+
+    @property
+    def is_expiring_soon(self):
+        """Check if certificate expires within 30 days"""
+        return 0 <= self.days_until_expiry <= 30
+
+    def save(self, *args, **kwargs):
+        # Auto-update status based on expiry date
+        if self.is_expired:
+            self.status = 'expired'
+        elif self.is_expiring_soon:
+            self.status = 'expiring_soon'
+        elif self.status in ['expired', 'expiring_soon']:
+            self.status = 'active'
+        
+        super().save(*args, **kwargs)
+
+# netbox_ssl_certificates/forms.py
+from django import forms
+from netbox.forms import NetBoxModelForm
+from .models import SSLCertificate, CertificateTypeChoices, CertificateStatusChoices
+
+class SSLCertificateForm(NetBoxModelForm):
+    class Meta:
+        model = SSLCertificate
+        fields = [
+            'name', 'common_name', 'subject_alternative_names', 'certificate_type',
+            'issuer', 'serial_number', 'issued_date', 'expiry_date', 'key_size',
+            'signature_algorithm', 'status', 'auto_renewal', 'certificate_pem', 'notes'
+        ]
+        widgets = {
+            'issued_date': forms.DateInput(attrs={'type': 'date'}),
+            'expiry_date': forms.DateInput(attrs={'type': 'date'}),
+            'subject_alternative_names': forms.Textarea(attrs={'rows': 3}),
+            'certificate_pem': forms.Textarea(attrs={'rows': 8}),
+            'notes': forms.Textarea(attrs={'rows': 3}),
+        }
+
+class SSLCertificateFilterForm(forms.Form):
+    q = forms.CharField(
+        required=False,
+        label='Search',
+        widget=forms.TextInput(attrs={'placeholder': 'Search certificates...'})
+    )
+    
+    certificate_type = forms.ChoiceField(
+        required=False,
+        choices=[('', 'All')] + CertificateTypeChoices.CHOICES,
+        label='Certificate Type'
+    )
+    
+    status = forms.ChoiceField(
+        required=False,
+        choices=[('', 'All')] + CertificateStatusChoices.CHOICES,
+        label='Status'
+    )
+    
+    issuer = forms.CharField(
+        required=False,
+        label='Issuer',
+        widget=forms.TextInput(attrs={'placeholder': 'Certificate Authority...'})
+    )
+    
+    expiring_within = forms.ChoiceField(
+        required=False,
+        choices=[
+            ('', 'Any time'),
+            ('7', 'Next 7 days'),
+            ('30', 'Next 30 days'),
+            ('90', 'Next 90 days'),
+        ],
+        label='Expiring Within'
+    )
+
+# netbox_ssl_certificates/views.py
+from django.shortcuts import render, get_object_or_404, redirect
+from django.contrib import messages
+from django.db.models import Q
+from netbox.views import generic
+from .models import SSLCertificate
+from .forms import SSLCertificateForm, SSLCertificateFilterForm
+from datetime import datetime, timedelta
+
+class SSLCertificateListView(generic.ObjectListView):
+    queryset = SSLCertificate.objects.all()
+    template_name = 'netbox_ssl_certificates/sslcertificate_list.html'
+    filterset_form = SSLCertificateFilterForm
+    
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        
+        # Apply search filter
+        q = self.request.GET.get('q')
+        if q:
+            queryset = queryset.filter(
+                Q(name__icontains=q) |
+                Q(common_name__icontains=q) |
+                Q(subject_alternative_names__icontains=q) |
+                Q(issuer__icontains=q)
+            )
+        
+        # Apply certificate type filter
+        cert_type = self.request.GET.get('certificate_type')
+        if cert_type:
+            queryset = queryset.filter(certificate_type=cert_type)
+        
+        # Apply status filter
+        status = self.request.GET.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        
+        # Apply issuer filter
+        issuer = self.request.GET.get('issuer')
+        if issuer:
+            queryset = queryset.filter(issuer__icontains=issuer)
+        
+        # Apply expiring within filter
+        expiring_within = self.request.GET.get('expiring_within')
+        if expiring_within:
+            days = int(expiring_within)
+            cutoff_date = datetime.now().date() + timedelta(days=days)
+            queryset = queryset.filter(expiry_date__lte=cutoff_date, expiry_date__gte=datetime.now().date())
+        
+        return queryset
+
+class SSLCertificateView(generic.ObjectView):
+    queryset = SSLCertificate.objects.all()
+    template_name = 'netbox_ssl_certificates/sslcertificate.html'
+
+class SSLCertificateEditView(generic.ObjectEditView):
+    queryset = SSLCertificate.objects.all()
+    form = SSLCertificateForm
+    template_name = 'netbox_ssl_certificates/sslcertificate_edit.html'
+
+class SSLCertificateDeleteView(generic.ObjectDeleteView):
+    queryset = SSLCertificate.objects.all()
+    template_name = 'netbox_ssl_certificates/sslcertificate_delete.html'
+
+# netbox_ssl_certificates/urls.py
+from django.urls import path
+from . import views
+
+app_name = 'netbox_ssl_certificates'
+
+urlpatterns = [
+    path('', views.SSLCertificateListView.as_view(), name='sslcertificate_list'),
+    path('add/', views.SSLCertificateEditView.as_view(), name='sslcertificate_add'),
+    path('<int:pk>/', views.SSLCertificateView.as_view(), name='sslcertificate'),
+    path('<int:pk>/edit/', views.SSLCertificateEditView.as_view(), name='sslcertificate_edit'),
+    path('<int:pk>/delete/', views.SSLCertificateDeleteView.as_view(), name='sslcertificate_delete'),
+]
+
+# netbox_ssl_certificates/tables.py
+import django_tables2 as tables
+from netbox.tables import NetBoxTable, ChoiceFieldColumn
+from .models import SSLCertificate
+
+class SSLCertificateTable(NetBoxTable):
+    name = tables.LinkColumn()
+    common_name = tables.Column()
+    certificate_type = ChoiceFieldColumn()
+    issuer = tables.Column()
+    expiry_date = tables.DateColumn()
+    days_until_expiry = tables.Column(
+        verbose_name='Days Until Expiry',
+        accessor='days_until_expiry',
+        attrs={'td': {'class': lambda record: 'text-danger' if record.is_expired else 'text-warning' if record.is_expiring_soon else ''}}
+    )
+    status = ChoiceFieldColumn()
+    
+    class Meta(NetBoxTable.Meta):
+        model = SSLCertificate
+        fields = ('pk', 'name', 'common_name', 'certificate_type', 'issuer', 'expiry_date', 'days_until_expiry', 'status')
+        default_columns = ('name', 'common_name', 'certificate_type', 'issuer', 'expiry_date', 'days_until_expiry', 'status')
+
+# netbox_ssl_certificates/management/commands/check_certificate_expiry.py
+from django.core.management.base import BaseCommand
+from django.core.mail import send_mail
+from django.conf import settings
+from netbox_ssl_certificates.models import SSLCertificate
+from datetime import datetime, timedelta
+
+class Command(BaseCommand):
+    help = 'Check for expiring SSL certificates and send notifications'
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--days',
+            type=int,
+            default=30,
+            help='Number of days before expiry to send notification (default: 30)'
+        )
+        parser.add_argument(
+            '--email',
+            type=str,
+            help='Email address to send notifications to'
+        )
+
+    def handle(self, *args, **options):
+        days_threshold = options['days']
+        email = options['email']
+        
+        cutoff_date = datetime.now().date() + timedelta(days=days_threshold)
+        expiring_certs = SSLCertificate.objects.filter(
+            expiry_date__lte=cutoff_date,
+            expiry_date__gte=datetime.now().date()
+        )
+        
+        if expiring_certs.exists():
+            message = "The following SSL certificates are expiring soon:\n\n"
+            for cert in expiring_certs:
+                days_left = cert.days_until_expiry
+                message += f"- {cert.name} ({cert.common_name}): expires in {days_left} days ({cert.expiry_date})\n"
+            
+            self.stdout.write(self.style.WARNING(message))
+            
+            if email:
+                send_mail(
+                    subject=f'SSL Certificates Expiring Within {days_threshold} Days',
+                    message=message,
+                    from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', 'noreply@example.com'),
+                    recipient_list=[email],
+                    fail_silently=False,
+                )
+                self.stdout.write(
+                    self.style.SUCCESS(f'Notification email sent to {email}')
+                )
+        else:
+            self.stdout.write(
+                self.style.SUCCESS(f'No certificates expiring within {days_threshold} days')
+            )
+
+# setup.py
+from setuptools import setup, find_packages
+
+setup(
+    name='netbox-ssl-certificates',
+    version='0.1',
+    description='NetBox plugin for tracking SSL certificates',
+    author='Cesar Villanueva',
+    author_email='ceo@sciverint.com',
+    url='https://github.com/sciverint/netbox-ssl-certificates',
+    packages=find_packages(),
+    include_package_data=True,
+    zip_safe=False,
+    install_requires=[
+        'netbox>=3.0.0',
+    ],
+    classifiers=[
+        'Development Status :: 4 - Beta',
+        'Environment :: Web Environment',
+        'Framework :: Django',
+        'Intended Audience :: System Administrators',
+        'License :: OSI Approved :: Apache Software License',
+        'Operating System :: OS Independent',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+    ],
+)
