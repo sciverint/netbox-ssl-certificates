@@ -7,7 +7,7 @@ setup(
     description='NetBox plugin for tracking SSL certificates',
     author='Cesar Villanueva',
     author_email='ceo@sciverint.com',
-    url='https://github.com/sciverint/netbox-ssl-certificates',
+    url='https://github.com/sciverint/netbox-ssl-certificates/netbox-ssl-certificates/',
     packages=find_packages(),
     include_package_data=True,
     zip_safe=False,
