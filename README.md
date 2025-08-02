@@ -29,7 +29,7 @@ The plugin integrates with NetBox's existing UI patterns and provides a solution
 
 Install the plugin:
  ```
-pip install -e /path/to/netbox-ssl-certificates
+pip install -e git+https://github.com/sciverint/netbox-ssl-certificates 
 ```
 
 Add to NetBox configuration (```configuration.py```):
